@@ -99,6 +99,7 @@ struct __packed ff_cfg {
     uint16_t display_scroll_pause;
     bool_t index_suppression;
     bool_t extend_image;
+    bool_t usb_ignore_wp;
 };
 
 extern struct ff_cfg ff_cfg;

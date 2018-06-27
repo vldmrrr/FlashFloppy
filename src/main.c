@@ -657,6 +657,10 @@ static void read_ff_cfg(void)
             ff_cfg.extend_image = !strcmp(opts.arg, "yes");
             break;
 
+        case FFCFG_usb_ignore_wp:
+            ff_cfg.usb_ignore_wp = !strcmp(opts.arg, "yes");
+            break;
+
         }
     }
 

@@ -177,7 +177,9 @@ bool_t usbh_msc_connected(void)
 
 bool_t usbh_msc_readonly(void)
 {
-    return usbh_msc_connected() && USBH_MSC_Param.MSWriteProtect;
+    return (usbh_msc_connected()
+            && !ff_cfg.usb_ignore_wp
+            && USBH_MSC_Param.MSWriteProtect);
 }
 
 /*
@@ -190,7 +192,7 @@ DSTATUS disk_initialize(BYTE pdrv)
         return RES_PARERR;
 
     dstatus = (!usbh_msc_connected() ? STA_NOINIT
-               : USBH_MSC_Param.MSWriteProtect ? STA_PROTECT
+               : usbh_msc_readonly() ? STA_PROTECT
                : 0);
 
     return dstatus;
