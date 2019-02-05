@@ -28,6 +28,7 @@ static bool_t ti99_open(struct image *im);
 #define LAYOUT_interleaved              0
 #define LAYOUT_interleaved_swap_sides   1
 #define LAYOUT_sequential_reverse_side1 2
+#define LAYOUT_mgd2                     3
 
 #define sec_sz(im) (128u << (im)->img.sec_no)
 
@@ -118,6 +119,9 @@ const static struct img_type {
     { 16, _S(2), _IAM, 57, 3, 1, 1, 0, 0, _C(40), _R(300) }, /* Type 03 */
     { 16, _S(2), _IAM, 57, 3, 1, 1, 0, 0, _C(80), _R(300) }, /* Type 07 */
     { 0 }
+}, mgd2_type[] = {
+    { 18, _S(2), _IAM, 84, 1, 2, 1, 0, 0, _C(80), _R(300) }, /* Cyl 0 */
+    { 11, _S(2), _IAM,  1, 1, 3, 1, 0, 0, _C(80), _R(300) }  /* Cyls 1+ */
 }, msx_type[] = {
     { 8, _S(1), _IAM, 84, 1, 2, 1, 0, 0, _C(80), _R(300) }, /* 320k */
     { 9, _S(1), _IAM, 84, 1, 2, 1, 0, 0, _C(80), _R(300) }, /* 360k */
@@ -153,6 +157,23 @@ static unsigned int enc_sec_sz(struct image *im)
         + sec_sz(im) + im->img.dam_sz_post;
 }
 
+static bool_t __img_open(struct image *im, const struct img_type *type)
+{
+    im->nr_sides = type->nr_sides + 1;
+    im->img.sec_no = type->no;
+    im->img.interleave = type->interleave;
+    im->img.skew = type->skew;
+    im->img.nr_sectors = type->nr_secs;
+    im->img.gap_3 = type->gap3;
+    im->img.rpm = (type->rpm + 5) * 60;
+    im->img.sec_base[0] = im->img.sec_base[1] = type->base;
+    if (type->inter_track_numbering == _ITN)
+        im->img.sec_base[1] += im->img.nr_sectors;
+    im->img.has_iam = type->has_iam;
+
+    return mfm_open(im);
+}
+
 static bool_t _img_open(struct image *im, const struct img_type *type)
 {
     unsigned int nr_cyls, cyl_sz, nr_sides;
@@ -182,19 +203,7 @@ static bool_t _img_open(struct image *im, const struct img_type *type)
 
 found:
     im->nr_cyls = nr_cyls;
-    im->nr_sides = nr_sides;
-    im->img.sec_no = type->no;
-    im->img.interleave = type->interleave;
-    im->img.skew = type->skew;
-    im->img.nr_sectors = type->nr_secs;
-    im->img.gap_3 = type->gap3;
-    im->img.rpm = (type->rpm + 5) * 60;
-    im->img.sec_base[0] = im->img.sec_base[1] = type->base;
-    if (type->inter_track_numbering == _ITN)
-        im->img.sec_base[1] += im->img.nr_sectors;
-    im->img.has_iam = type->has_iam;
-
-    return mfm_open(im);
+    return __img_open(im, type);
 }
 
 static bool_t adfs_open(struct image *im)
@@ -253,6 +262,12 @@ static bool_t img_open(struct image *im)
         im->img.post_crc_syncs = 1;
         return _img_open(im, uknc_type);
     default:
+        if (im_size(im) == 1798144) {
+            /* MGD2 */
+            im->img.layout = LAYOUT_mgd2;
+            im->nr_cyls = 80;
+            return __img_open(im, &mgd2_type[0]);
+        }
         type = img_type;
         break;
     }
@@ -945,6 +960,12 @@ static void img_seek_track(
     uint32_t trk_len;
     unsigned int base, i, pos, trk = cyl * im->nr_sides + side;
 
+    switch (im->img.layout) {
+    case LAYOUT_mgd2:
+        (void)__img_open(im, &mgd2_type[!!cyl]);
+        break;
+    }
+
     im->cur_track = track;
 
     /* Create logical sector map in rotational order. */
@@ -961,6 +982,11 @@ static void img_seek_track(
 
     trk_len = im->img.nr_sectors * sec_sz(im);
     switch (im->img.layout) {
+    case LAYOUT_mgd2:
+        im->img.trk_off = trk * trk_len;
+        if (cyl != 0)
+            im->img.trk_off -= 4096;
+        break;
     case LAYOUT_sequential_reverse_side1:
         im->img.trk_off = (side ? 2*im->nr_cyls - cyl - 1 : cyl) * trk_len;
         break;
