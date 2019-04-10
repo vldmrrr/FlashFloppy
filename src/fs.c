@@ -149,6 +149,12 @@ void F_closedir(DIR *dp)
     handle_fr(fr);
 }
 
+void F_dir_prev(DIR *dp)
+{
+    FRESULT fr = f_dir_prev(dp);
+    handle_fr(fr);
+}
+
 void F_readdir(DIR *dp, FILINFO *fno)
 {
     FRESULT fr = f_readdir(dp, fno);

@@ -19,6 +19,26 @@ static struct {
     char buf[512];
 } *fs;
 
+struct dir_pos {
+    DWORD clust, dptr;
+};
+
+static void dp_save(const DIR *dir, struct dir_pos *dp)
+{
+    dp->clust = dir->clust;
+    dp->dptr = dir->dptr;
+}
+
+static void dp_restore(DIR *dir, const struct dir_pos *dp)
+{
+    FATFS *fs = dir->obj.fs;
+    dir->clust = dp->clust;
+    dir->dptr = dp->dptr;
+    /* from clst2sect */
+    dir->sect = fs->database + fs->csize * (dir->clust-2);
+    dir->sect += (dir->dptr / 512) & (fs->csize - 1);
+}
+
 static struct {
     uint16_t slot_nr, max_slot_nr;
     uint8_t slot_map[1000/8];
@@ -32,6 +52,8 @@ static struct {
         uint32_t cdir;
         uint16_t slot;
     } stack[20];
+    struct dir_pos dp_max_slot, dp_cur_slot;
+    uint16_t dp_cur_slot_nr;
     uint8_t depth;
     bool_t usb_power_fault;
     uint8_t dirty_slot_nr:1;
@@ -541,30 +563,79 @@ static void dump_file(void)
 #endif
 }
 
+static bool_t native_accept(void)
+{
+    /* Skip dot files. */
+    if (fs->fp.fname[0] == '.')
+        return FALSE;
+    /* Skip hidden files/folders. */
+    if (fs->fp.fattrib & AM_HID)
+        return FALSE;
+    /* Allow folder navigation when LCD/OLED display is attached. */
+    if ((fs->fp.fattrib & AM_DIR) && (display_mode == DM_LCD_1602)
+        /* Skip FF/ in root folder */
+        && ((cfg.depth != 0) || strcmp(fs->fp.fname, "FF"))
+        /* Skip __MACOSX/ zip-file resource-fork folder */
+        && strcmp(fs->fp.fname, "__MACOSX"))
+        return TRUE;
+    /* Allow valid image files. */
+    return image_valid(&fs->fp);
+    
+}
+
+static bool_t native_dir_prev(void)
+{
+    struct dir_pos dp;
+    do {
+        F_dir_prev(&fs->dp);
+        dp_save(&fs->dp, &dp);
+        F_readdir(&fs->dp, &fs->fp);
+        dp_restore(&fs->dp, &dp);
+        if (fs->fp.fname[0] == '\0')
+            return FALSE;
+    } while (!native_accept());
+    cfg.dp_cur_slot_nr--;
+    cfg.dp_cur_slot = dp;
+    return TRUE;
+}
+
 static bool_t native_dir_next(void)
 {
-    for (;;) {
+    do {
         F_readdir(&fs->dp, &fs->fp);
         if (fs->fp.fname[0] == '\0')
             return FALSE;
-        /* Skip dot files. */
-        if (fs->fp.fname[0] == '.')
-            continue;
-        /* Skip hidden files/folders. */
-        if (fs->fp.fattrib & AM_HID)
-            continue;
-        /* Allow folder navigation when LCD/OLED display is attached. */
-        if ((fs->fp.fattrib & AM_DIR) && (display_mode == DM_LCD_1602)
-            /* Skip FF/ in root folder */
-            && ((cfg.depth != 0) || strcmp(fs->fp.fname, "FF"))
-            /* Skip __MACOSX/ zip-file resource-fork folder */
-            && strcmp(fs->fp.fname, "__MACOSX"))
-            break;
-        /* Allow valid image files. */
-        if (image_valid(&fs->fp))
-            break;
-    }
+    } while (!native_accept());
+    cfg.dp_cur_slot_nr++;
+    dp_save(&fs->dp, &cfg.dp_cur_slot);
     return TRUE;
+}
+
+static void native_dir(uint16_t slot)
+{
+    uint16_t nr = cfg.dp_cur_slot_nr;
+    if (nr <= slot) {
+        if ((slot-nr) > (cfg.max_slot_nr+1-slot)) {
+            /* Quicker to start at slot @max+1. */
+            cfg.dp_cur_slot_nr = cfg.max_slot_nr+1;
+            cfg.dp_cur_slot = cfg.dp_max_slot;
+            return native_dir(slot);
+        }
+        dp_restore(&fs->dp, &cfg.dp_cur_slot);
+        while (nr++ <= slot)
+            native_dir_next();
+    } else {
+        if ((nr-slot) > slot) {
+            /* Quicker to start at slot 0. */
+            F_readdir(&fs->dp, NULL);
+            dp_save(&fs->dp, &cfg.dp_cur_slot);
+            cfg.dp_cur_slot_nr = 0;
+            return native_dir(slot);
+        }
+        dp_restore(&fs->dp, &cfg.dp_cur_slot);
+        while (nr-- > slot)
+            native_dir_prev();
+    }
 }
 
 int set_slot_by_name(const char *name, void *scratch)
@@ -1144,12 +1215,29 @@ static void native_update(uint8_t slot_mode)
         memset(&cfg.slot_map, 0xff, sizeof(cfg.slot_map));
         cfg.max_slot_nr = cfg.depth ? 1 : 0;
         F_opendir(&fs->dp, "");
-        while (native_dir_next())
+        i = 0;
+        while (native_dir_next()) {
+            printk("%u: '%s'\n", i++, fs->fp.fname);
             cfg.max_slot_nr++;
+        }
+        dp_save(&fs->dp, &cfg.dp_max_slot);
+        dp_save(&fs->dp, &cfg.dp_cur_slot);
+        cfg.dp_cur_slot_nr = cfg.max_slot_nr;
         /* Adjust max_slot_nr. Must be at least one 'slot'. */
         if (!cfg.max_slot_nr)
             F_die(FR_NO_DIRENTS);
         cfg.max_slot_nr--;
+
+        fs->fp.fname[0] = 0;
+        native_dir(111);
+        printk("%u: '%s'\n", 111, fs->fp.fname);
+        native_dir(107);
+        printk("%u: '%s'\n", 107, fs->fp.fname);
+        native_dir(3);
+        printk("%u: '%s'\n", 3, fs->fp.fname);
+        native_dir(29);
+        printk("%u: '%s'\n", 29, fs->fp.fname);
+
         F_closedir(&fs->dp);
         /* Select last disk_index if not greater than available slots. */
         cfg.slot_nr = (cfg.slot_nr <= cfg.max_slot_nr) ? cfg.slot_nr : 0;

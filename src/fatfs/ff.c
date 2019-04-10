@@ -1620,8 +1620,50 @@ FRESULT dir_next (	/* FR_OK(0):succeeded, FR_NO_FILE:End of table, FR_DENIED:Cou
 	return FR_OK;
 }
 
+static
+FRESULT dir_prev (	/* FR_OK(0):succeeded, FR_NO_FILE:End of table */
+	DIR* dp		/* Pointer to the directory object */
+)
+{
+    DWORD ofs, clst;
+    FATFS *fs = dp->obj.fs;
 
+    if ((dp->sect == 0) || (ofs = dp->dptr) == 0) {
+        dp->sect = 0;
+        return FR_NO_FILE;
+    }
 
+    if (ofs % SS(fs) == 0) { /* sector change */
+        if ((dp->clust != 0) /* dynamic table */
+            && ((ofs / SS(fs) & (fs->csize - 1)) == 0)) { /* cluster change */
+            /* Guess previous cluster is contiguous */
+            clst = get_fat(&dp->obj, dp->clust-1);
+            if (clst <= 1) return FR_INT_ERR;
+            if (clst == 0xFFFFFFFF) return FR_DISK_ERR;
+            if (clst != dp->clust) {
+                /* It's discontiguous: walk chain from the start. */
+                DWORD o, csz;
+                clst = dp->obj.sclust ?: fs->dirbase;
+                csz = (DWORD)fs->csize * SS(fs); /* bytes per cluster */
+                for (o = ofs-1; o >= csz; o -= csz) {
+                    clst = get_fat(&dp->obj, clst);
+                    if (clst == 0xFFFFFFFF) return FR_DISK_ERR;
+                    if (clst < 2 || clst >= fs->n_fatent) return FR_INT_ERR;
+                }
+                dp->clust = clst + 1;
+                dp->sect = clst2sect(fs, clst) + fs->csize;
+            }
+            dp->clust--;
+        }
+        dp->sect--;
+    }
+
+    ofs -= SZDIRE;
+    dp->dptr = ofs;
+    dp->dir = fs->win + ofs % SS(fs);
+
+    return FR_OK;
+}
 
 #if !FF_FS_READONLY
 /*-----------------------------------------------------------------------*/
@@ -4303,6 +4345,52 @@ FRESULT f_closedir (
 /*-----------------------------------------------------------------------*/
 /* Read Directory Entries in Sequence                                    */
 /*-----------------------------------------------------------------------*/
+
+
+FRESULT f_dir_prev(DIR *dp)
+{
+    FRESULT res;
+    FATFS *fs;
+    BYTE a, c;
+
+    res = validate(&dp->obj, &fs);
+    if (res != FR_OK)
+        goto out;
+
+    /* Find preceding valid dirent. */
+    do {
+        if ((res = dir_prev(dp)) != FR_OK)
+            goto out;
+        if ((res = move_window(fs, dp->sect)) != FR_OK)
+            goto out;
+        a = dp->dir[DIR_Attr] & AM_MASK;
+        c = dp->dir[DIR_Name];
+    } while (c == DDEM || c == '.' || (a & ~AM_ARC) == AM_VOL);
+
+    /* There can't be any LFN dirents. Bail. */
+    if (dp->dptr == 0)
+        goto out;
+
+    /* Walk over associated LFN dirents, looking for the first. */
+    do {
+        if ((res = dir_prev(dp)) != FR_OK)
+            goto out;
+        if ((res = move_window(fs, dp->sect)) != FR_OK)
+            goto out;
+        a = dp->dir[DIR_Attr] & AM_MASK;
+        c = dp->dir[DIR_Name];
+        if (a != AM_LFN) {
+            /* No LFN dirents, roll back to the main dirent. */
+            res = dir_next(dp, 0);
+            break;
+        }
+    } while (!(c & 0x40));
+
+out:
+    if (res == FR_NO_FILE)
+        res = FR_OK;
+    LEAVE_FF(fs, res);
+}
 
 FRESULT f_readdir (
 	DIR* dp,			/* Pointer to the open directory object */
