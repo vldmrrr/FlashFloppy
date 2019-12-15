@@ -1580,6 +1580,7 @@ static void simple_layout(struct image *im, const struct simple_layout *layout)
     /* Create a sector-info list. There is one per side. */
     p = adj_p(p, layout->nr_sectors * im->nr_sides * sizeof(*sec));
     sec = im->img.sec_info_base = (struct img_sec *)p;
+    memset(sec, 0, layout->nr_sectors * im->nr_sides * sizeof(*sec));
     for (i = 0; i < im->nr_sides; i++) {
         for (j = 0; j < layout->nr_sectors; j++) {
             sec->id = j + layout->base[i];
@@ -1591,20 +1592,21 @@ static void simple_layout(struct image *im, const struct simple_layout *layout)
     /* Create the track-info list. One per side. */
     p = adj_p(p, im->nr_sides * sizeof(*trk));
     trk = im->img.trk_info = (struct img_trk *)p;
+    memset(trk, 0, im->nr_sides * sizeof(*trk));
     for (j = 0; j < im->nr_sides; j++) {
         trk->nr_sectors = layout->nr_sectors;
         trk->sec_off = j * layout->nr_sectors;
+        trk->gap_3 = layout->gap3;
         trk++;
     }
 
     /* Create track map. This maps track# to a track-info structure. */
     p = adj_p(p, im->nr_cyls * im->nr_sides * sizeof(*trk_map));
     trk_map = im->img.trk_map = (uint8_t *)p;
+    memset(trk_map, 0, im->nr_cyls * im->nr_sides);
     for (i = 0; i < im->nr_cyls; i++)
         for (j = 0; j < im->nr_sides; j++)
             *trk_map++ = j;
-            
-    memset(trk_map, 0, im->nr_cyls * im->nr_sides);
 }
 
 static void img_prep(struct image *im)
