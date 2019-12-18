@@ -151,10 +151,23 @@ static FSIZE_t im_size(struct image *im)
         : (f_size(&im->fp) - im->img.base_off);
 }
 
+static void init_sec_base(struct image *im, uint8_t base)
+{
+    memset(im->img.sec_base, base, sizeof(im->img.sec_base));
+}
+
+#if 0
+static uint8_t sec_base(struct image *im)
+{
+    unsigned int i = ((im->cur_track/2) == 0) ? 0 : 2;
+    return im->img.sec_base[i + (im->cur_track & (im->nr_sides - 1))];
+}
+#endif
+
 static unsigned int enc_sec_sz(struct image *im, struct img_sec *sec)
 {
     return im->img.idam_sz + im->img.dam_sz_pre
-        + sec_sz(sec->no) + im->img.dam_sz_post;
+        + sec_sz(sec ? sec->no : im->img.sec_no) + im->img.dam_sz_post;
 }
 
 static void reset_img_params(struct image *im)
@@ -194,10 +207,16 @@ static bool_t _img_open(struct image *im, const struct img_type *type)
 found:
     im->nr_cyls = nr_cyls;
     im->nr_sides = nr_sides;
+    im->img.sec_no = type->no;
     im->img.interleave = type->interleave;
     im->img.sskew = type->sskew;
     im->img.cskew = type->cskew;
+    im->img.nr_sectors = type->nr_secs;
+    im->img.gap_3 = type->gap3;
     im->img.rpm = (type->rpm + 5) * 60;
+    init_sec_base(im, type->base);
+    if (type->inter_track_numbering == _ITN)
+        im->img.sec_base[3] = (im->img.sec_base[1] += im->img.nr_sectors);
     im->img.has_iam = type->has_iam;
 
     layout.nr_sectors = type->nr_secs;
@@ -1156,7 +1175,7 @@ static void img_extend(struct image *im)
     for (i = 0; i < im->nr_cyls * im->nr_sides; i++) {
         trk = &im->img.trk_info[im->img.trk_map[i]];
         sec = &im->img.sec_info_base[trk->sec_off];
-        for (j = 0; j < trk->nr_sectors; j++) {
+        for (j = 0; j < im->img.nr_sectors; j++) {
             sz += sec_sz(sec->no);
             sec++;
         }
@@ -1202,13 +1221,13 @@ static void img_seek_track(
     im->img.sec_info = &im->img.sec_info_base[trk->sec_off];
 
     /* Create logical sector map in rotational order. */
-    memset(im->img.sec_map, 0xff, trk->nr_sectors);
-    pos = ((cyl*im->img.cskew) + (side*im->img.sskew)) % trk->nr_sectors;
-    for (i = 0; i < trk->nr_sectors; i++) {
+    memset(im->img.sec_map, 0xff, im->img.nr_sectors);
+    pos = ((cyl*im->img.cskew) + (side*im->img.sskew)) % im->img.nr_sectors;
+    for (i = 0; i < im->img.nr_sectors; i++) {
         while (im->img.sec_map[pos] != 0xff)
-            pos = (pos + 1) % trk->nr_sectors;
+            pos = (pos + 1) % im->img.nr_sectors;
         im->img.sec_map[pos] = i;
-        pos = (pos + im->img.interleave) % trk->nr_sectors;
+        pos = (pos + im->img.interleave) % im->img.nr_sectors;
     }
 
     /* Sort out all other logical layout issues. */
@@ -1227,7 +1246,7 @@ static void img_seek_track(
                 continue;
             trk = &im->img.trk_info[im->img.trk_map[i*im->nr_sides + j]];
             sec = &im->img.sec_info_base[trk->sec_off];
-            for (k = 0; k < trk->nr_sectors; k++) {
+            for (k = 0; k < im->img.nr_sectors; k++) {
                 off += sec_sz(sec->no);
                 sec++;
             }
@@ -1247,19 +1266,18 @@ static uint32_t calc_start_pos(struct image *im)
         /* Post-index track gap */
         im->img.decode_pos = 0;
     } else {
-        struct img_trk *trk = im->img.trk;
         uint8_t *sec_map = im->img.sec_map;
         unsigned int i, ess;
         struct img_sec *sec;
         decode_off -= im->img.idx_sz;
-        for (i = 0; i < trk->nr_sectors; i++) {
+        for (i = 0; i < im->img.nr_sectors; i++) {
             sec = &im->img.sec_info[*sec_map++];
             ess = enc_sec_sz(im, sec);
             if (decode_off < ess)
                 break;
             decode_off -= ess;
         }
-        if (i < trk->nr_sectors) {
+        if (i < im->img.nr_sectors) {
             /* IDAM */
             im->img.trk_sec = i;
             im->img.decode_pos = i * 4 + 1;
@@ -1281,13 +1299,13 @@ static uint32_t calc_start_pos(struct image *im)
                         decode_off -= sec_sz(sec->no);
                         im->img.decode_pos++;
                         /* Start fetch at next sector. */
-                        im->img.trk_sec = (i + 1) % trk->nr_sectors;
+                        im->img.trk_sec = (i + 1) % im->img.nr_sectors;
                     }
                 }
             }
         } else {
             /* Pre-index track gap */
-            im->img.decode_pos = trk->nr_sectors * 4 + 1;
+            im->img.decode_pos = im->img.nr_sectors * 4 + 1;
             im->img.decode_data_pos = decode_off / 1024;
             decode_off %= 1024;
         }
@@ -1343,7 +1361,6 @@ static bool_t img_write_track(struct image *im)
     const uint8_t mfm_dam_header[] = { 0xa1, 0xa1, 0xa1, 0xfb };
 
     bool_t flush;
-    struct img_trk *trk = im->img.trk;
     struct write *write = get_write(im, im->wr_cons);
     struct image_buf *wr = &im->bufs.write_bc;
     uint16_t *buf = wr->p;
@@ -1369,7 +1386,7 @@ static bool_t img_write_track(struct image *im)
 
         /* Convert write offset to sector number (in rotational order). */
         base -= im->img.idx_sz + im->img.idam_sz;
-        for (i = 0; i < trk->nr_sectors; i++) {
+        for (i = 0; i < im->img.nr_sectors; i++) {
             /* Within small range of expected data start? */
             if ((base >= -64) && (base <= 64))
                 break;
@@ -1377,7 +1394,7 @@ static bool_t img_write_track(struct image *im)
         }
 
         /* Convert rotational order to logical order. */
-        if (i >= trk->nr_sectors) {
+        if (i >= im->img.nr_sectors) {
             printk("IMG Bad Sector Offset: %u -> %u\n", base, i);
             im->img.write_sector = -2;
         } else {
@@ -1441,11 +1458,11 @@ static bool_t img_write_track(struct image *im)
             }
             /* Search by sector id for this sector's logical order. */
             for (i = 0, sec = im->img.sec_info;
-                 (i < trk->nr_sectors) && (sec->id != id);
+                 (i < im->img.nr_sectors) && (sec->id != id);
                  i++, sec++)
                 continue;
             im->img.write_sector = i;
-            if (i >= trk->nr_sectors) {
+            if (i >= im->img.nr_sectors) {
                 printk("IMG IDAM Bad Sector: %02x\n", id);
                 im->img.write_sector = -2;
             }
@@ -1475,7 +1492,7 @@ static bool_t img_write_track(struct image *im)
 
             /* All good: write out to mass storage. */
             printk("Write %u[%02x]/%u... ", im->img.write_sector,
-                   sec->id, trk->nr_sectors);
+                   sec->id, im->img.nr_sectors);
             t = time_now();
             sec = im->img.sec_info;
             for (i = off = 0; i < im->img.write_sector; i++)
@@ -1499,7 +1516,7 @@ static void img_dump_info(struct image *im)
     printk("C%u S%u:: %s %u-%u-%u:\n",
            im->cur_track/2, im->cur_track&1,
            (im->sync == SYNC_fm) ? "FM" : "MFM",
-           im->nr_cyls, im->nr_sides, trk->nr_sectors);
+           im->nr_cyls, im->nr_sides, im->img.nr_sectors);
     printk(" rpm: %u, tracklen: %u, datarate: %u\n",
            im->img.rpm, im->tracklen_bc, trk->data_rate);
     printk(" gap2: %u, gap3: %u, gap4a: %u, gap4: %u\n",
@@ -1509,7 +1526,7 @@ static void img_dump_info(struct image *im)
     printk(" interleave: %u, cskew %u, sskew %u\n ",
            im->img.interleave, im->img.cskew, im->img.sskew);
     printk(" file-layout: %x\n", im->img.layout);
-    for (i = 0; i < trk->nr_sectors; i++) {
+    for (i = 0; i < im->img.nr_sectors; i++) {
         struct img_sec *sec = &im->img.sec_info[im->img.sec_map[i]];
         printk("{%u,%u} ", sec->id, sec->no);
     }
@@ -1546,7 +1563,7 @@ static void img_fetch_data(struct image *im)
         im->img.rd_sec_pos++;
     } else {
         im->img.rd_sec_pos = 0;
-        if (++im->img.trk_sec >= im->img.trk->nr_sectors)
+        if (++im->img.trk_sec >= im->img.nr_sectors)
             im->img.trk_sec = 0;
     }
 
@@ -1658,7 +1675,7 @@ static void mfm_prep_track(struct image *im)
 
     /* Work out minimum track length (with no pre-index track gap). */
     tracklen = im->img.idx_sz;
-    for (i = 0; i < trk->nr_sectors; i++)
+    for (i = 0; i < im->img.nr_sectors; i++)
         tracklen += enc_sec_sz(im, &im->img.sec_info[i]);
     tracklen *= 16;
 
@@ -1678,13 +1695,13 @@ static void mfm_prep_track(struct image *im)
     /* Calculate a suitable GAP3 if not specified. */
     if (gap_3 == 0) {
         int space;
-        uint8_t no = trk->nr_sectors ? im->img.sec_info[0].no : 2;
+        uint8_t no = im->img.nr_sectors ? im->img.sec_info[0].no : 2;
         im->img.dam_sz_post -= trk->gap_3;
-        tracklen -= 16 * trk->nr_sectors * trk->gap_3;
+        tracklen -= 16 * im->img.nr_sectors * trk->gap_3;
         space = max_t(int, 0, im->tracklen_bc - tracklen);
-        trk->gap_3 = min_t(int, space/(16*trk->nr_sectors), GAP_3[no]);
+        trk->gap_3 = min_t(int, space/(16*im->img.nr_sectors), GAP_3[no]);
         im->img.dam_sz_post += trk->gap_3;
-        tracklen += 16 * trk->nr_sectors * trk->gap_3;
+        tracklen += 16 * im->img.nr_sectors * trk->gap_3;
     }
 
     /* Does the track data fit within standard track length? */
@@ -1709,6 +1726,9 @@ static void mfm_prep_track(struct image *im)
 
     im->write_bc_ticks = sysclk_us(500) / trk->data_rate;
 
+    im->img.gap_3 = 40;
+    im->img.nr_sectors = 20;
+
     img_dump_info(im);
 }
 
@@ -1718,6 +1738,7 @@ static bool_t mfm_open(struct image *im)
 
     im->img.gap_2 = im->img.gap_2 ?: GAP_2;
     im->img.gap_4a = im->img.gap_4a ?: GAP_4A;
+    im->img.rpm = 300;
     im->stk_per_rev = (stk_ms(200) * 300) / im->img.rpm;
     im->sync = SYNC_mfm;
 
@@ -1765,7 +1786,7 @@ static bool_t mfm_read_track(struct image *im)
             for (i = 0; i < GAP_1; i++)
                 emit_byte(0x4e);
         }
-    } else if (im->img.decode_pos == (im->img.trk->nr_sectors * 4 + 1)) {
+    } else if (im->img.decode_pos == (im->img.nr_sectors * 4 + 1)) {
         /* Pre-index track gap */
         uint16_t sz = im->img.gap_4 - im->img.decode_data_pos * 1024;
         if (bc_space < min_t(unsigned int, sz, 1024))
@@ -1843,7 +1864,7 @@ static bool_t mfm_read_track(struct image *im)
             emit_byte(crc);
             for (i = 0; i < im->img.post_crc_syncs; i++)
                 emit_raw(0x4489);
-            for (i = 0; i < im->img.trk->gap_3; i++)
+            for (i = 0; i < im->img.gap_3; i++)
                 emit_byte(0x4e);
             break;
         }
