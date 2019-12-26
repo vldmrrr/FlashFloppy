@@ -156,13 +156,11 @@ static void init_sec_base(struct image *im, uint8_t base)
     memset(im->img.sec_base, base, sizeof(im->img.sec_base));
 }
 
-#if 0
 static uint8_t sec_base(struct image *im)
 {
     unsigned int i = ((im->cur_track/2) == 0) ? 0 : 2;
     return im->img.sec_base[i + (im->cur_track & (im->nr_sides - 1))];
 }
-#endif
 
 static unsigned int enc_sec_sz(struct image *im, struct img_sec *sec)
 {
@@ -1190,25 +1188,11 @@ static void img_extend(struct image *im)
         F_die(FR_DISK_FULL);
 }
 
-static unsigned int file_idx(
-    struct image *im, unsigned int cyl, unsigned int side)
-{
-    unsigned int _c, _s;
-    _c = (im->img.layout & LAYOUT_reverse_side(side))
-        ? im->nr_cyls - cyl - 1
-        : cyl;
-    _s = (im->img.layout & LAYOUT_sides_swapped)
-        ? side ^ (im->nr_sides - 1)
-        : side;
-    return (im->img.layout & LAYOUT_sequential)
-        ? (_s * im->nr_cyls) + _c
-        : (_c * im->nr_sides) + _s;
-}
-
 static void img_seek_track(
     struct image *im, uint16_t track, unsigned int cyl, unsigned int side)
 {
-    unsigned int i, j, k, pos, idx, off;
+    uint32_t trk_len;
+    unsigned int base, i, pos, _c, _s, idx;
     struct img_trk *trk;
     struct img_sec *sec;
 
@@ -1218,15 +1202,19 @@ static void img_seek_track(
     idx = cyl*im->nr_sides + side;
     trk = &im->img.trk_info[im->img.trk_map[cyl*im->nr_sides + side]];
     im->img.trk = trk;
-    im->img.sec_info = &im->img.sec_info_base[trk->sec_off];
+    sec = im->img.sec_info = &im->img.sec_info_base[trk->sec_off];
 
     /* Create logical sector map in rotational order. */
     memset(im->img.sec_map, 0xff, im->img.nr_sectors);
     pos = ((cyl*im->img.cskew) + (side*im->img.sskew)) % im->img.nr_sectors;
+    base = sec_base(im);
     for (i = 0; i < im->img.nr_sectors; i++) {
         while (im->img.sec_map[pos] != 0xff)
             pos = (pos + 1) % im->img.nr_sectors;
         im->img.sec_map[pos] = i;
+        sec->id = i + base;
+        sec->no = im->img.sec_no;
+        sec++;
         pos = (pos + im->img.interleave) % im->img.nr_sectors;
     }
 
@@ -1237,22 +1225,18 @@ static void img_seek_track(
         mfm_prep_track(im);
     }
 
-    /* Find offset of track data in the image file. */
-    idx = file_idx(im, cyl, side);
-    off = im->img.base_off;
-    for (i = 0; i < im->nr_cyls; i++) {
-        for (j = 0; j < im->nr_sides; j++) {
-            if (file_idx(im, i, j) >= idx)
-                continue;
-            trk = &im->img.trk_info[im->img.trk_map[i*im->nr_sides + j]];
-            sec = &im->img.sec_info_base[trk->sec_off];
-            for (k = 0; k < im->img.nr_sectors; k++) {
-                off += sec_sz(sec->no);
-                sec++;
-            }
-        }
-    }
-    im->img.trk_off = off;
+    trk_len = im->img.nr_sectors * sec_sz(im->img.sec_no);
+    _c = (im->img.layout & LAYOUT_reverse_side(side))
+        ? im->nr_cyls - cyl - 1
+        : cyl;
+    _s = (im->img.layout & LAYOUT_sides_swapped)
+        ? side ^ (im->nr_sides - 1)
+        : side;
+    idx = (im->img.layout & LAYOUT_sequential)
+        ? (_s * im->nr_cyls) + _c
+        : (_c * im->nr_sides) + _s;
+
+    im->img.trk_off = (idx * trk_len) + im->img.base_off;
 }
 
 static uint32_t calc_start_pos(struct image *im)
