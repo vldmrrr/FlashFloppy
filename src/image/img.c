@@ -1495,16 +1495,15 @@ static bool_t img_write_track(struct image *im)
 
 static void img_dump_info(struct image *im)
 {
-    struct img_trk *trk = im->img.trk;
     unsigned int i;
     printk("C%u S%u:: %s %u-%u-%u:\n",
            im->cur_track/2, im->cur_track&1,
            (im->sync == SYNC_fm) ? "FM" : "MFM",
            im->nr_cyls, im->nr_sides, im->img.nr_sectors);
     printk(" rpm: %u, tracklen: %u, datarate: %u\n",
-           im->img.rpm, im->tracklen_bc, trk->data_rate);
+           im->img.rpm, im->tracklen_bc, im->img.data_rate);
     printk(" gap2: %u, gap3: %u, gap4a: %u, gap4: %u\n",
-           im->img.gap_2, trk->gap_3, im->img.gap_4a, im->img.gap_4);
+           im->img.gap_2, im->img.gap_3, im->img.gap_4a, im->img.gap_4);
     printk(" ticks_per_cell: %u, write_bc_ticks: %u, has_iam: %u\n",
            im->ticks_per_cell, im->write_bc_ticks, im->img.has_iam);
     printk(" interleave: %u, cskew %u, sskew %u\n ",
@@ -1634,58 +1633,56 @@ static void img_prep(struct image *im)
 #define GAP_SYNC 12
 
 /* Shrink the IDAM pre-sync gap if sectors are close together. */
-#define idam_gap_sync(im) min_t(uint8_t, (im)->img.trk->gap_3, GAP_SYNC)
+#define idam_gap_sync(im) min_t(uint8_t, (im)->img.gap_3, GAP_SYNC)
 
 static void mfm_prep_track(struct image *im)
 {
     const uint8_t GAP_3[] = { 32, 54, 84, 116, 255, 255, 255, 255 };
-    struct img_trk *trk = im->img.trk;
     uint32_t tracklen;
-    uint8_t gap_3 = trk->gap_3;
+    uint8_t gap_3 = im->img.gap_3;
+    uint8_t *sec_map;
     unsigned int i;
-
-    /* GAP_SYNC is a suitable small initial guess for auto GAP3. */
-    trk->gap_3 = trk->gap_3 ?: GAP_SYNC;
 
     im->img.idx_sz = im->img.gap_4a;
     if (im->img.has_iam)
         im->img.idx_sz += GAP_SYNC + 4 + GAP_1;
     im->img.idam_sz = idam_gap_sync(im) + 8 + 2 + im->img.gap_2;
     im->img.dam_sz_pre = GAP_SYNC + 4;
-    im->img.dam_sz_post = 2 + trk->gap_3;
+    im->img.dam_sz_post = 2 + im->img.gap_3;
 
     im->img.idam_sz += im->img.post_crc_syncs;
     im->img.dam_sz_post += im->img.post_crc_syncs;
 
     /* Work out minimum track length (with no pre-index track gap). */
+    sec_map = im->img.sec_map;
     tracklen = im->img.idx_sz;
     for (i = 0; i < im->img.nr_sectors; i++)
-        tracklen += enc_sec_sz(im, &im->img.sec_info[i]);
+        tracklen += enc_sec_sz(im, &im->img.sec_info[*sec_map++]);
     tracklen *= 16;
 
-    if (trk->data_rate == 0) {
+    if (im->img.data_rate == 0) {
         /* Infer the data rate. */
         for (i = 1; i < 3; i++) { /* DD=1, HD=2, ED=3 */
             uint32_t maxlen = (((50000u * 300) / im->img.rpm) << i) + 5000;
             if (tracklen < maxlen)
                 break;
         }
-        trk->data_rate = 125u << i; /* DD=250, HD=500, ED=1000 */
+        im->img.data_rate = 125u << i; /* DD=250, HD=500, ED=1000 */
     }
 
     /* Calculate standard track length from data rate and RPM. */
-    im->tracklen_bc = (trk->data_rate * 400 * 300) / im->img.rpm;
+    im->tracklen_bc = (im->img.data_rate * 400 * 300) / im->img.rpm;
 
     /* Calculate a suitable GAP3 if not specified. */
     if (gap_3 == 0) {
         int space;
-        uint8_t no = im->img.nr_sectors ? im->img.sec_info[0].no : 2;
-        im->img.dam_sz_post -= trk->gap_3;
-        tracklen -= 16 * im->img.nr_sectors * trk->gap_3;
+        im->img.dam_sz_post -= im->img.gap_3;
+        tracklen -= 16 * im->img.nr_sectors * im->img.gap_3;
         space = max_t(int, 0, im->tracklen_bc - tracklen);
-        trk->gap_3 = min_t(int, space/(16*im->img.nr_sectors), GAP_3[no]);
-        im->img.dam_sz_post += trk->gap_3;
-        tracklen += 16 * im->img.nr_sectors * trk->gap_3;
+        im->img.gap_3 = min_t(int, space/(16*im->img.nr_sectors),
+                              GAP_3[im->img.sec_no]);
+        im->img.dam_sz_post += im->img.gap_3;
+        tracklen += 16 * im->img.nr_sectors * im->img.gap_3;
     }
 
     /* Does the track data fit within standard track length? */
@@ -1708,10 +1705,9 @@ static void mfm_prep_track(struct image *im)
                           / im->tracklen_bc);
     im->img.gap_4 = (im->tracklen_bc - tracklen) / 16;
 
-    im->write_bc_ticks = sysclk_us(500) / trk->data_rate;
+    im->write_bc_ticks = sysclk_us(500) / im->img.data_rate;
 
-    im->img.gap_3 = 40;
-    im->img.nr_sectors = 20;
+    im->sync = SYNC_mfm;
 
     img_dump_info(im);
 }
@@ -1894,8 +1890,8 @@ static void fm_prep_track(struct image *im)
     tracklen *= 16;
 
     /* Calculate data rate and track length. */
-    trk->data_rate = trk->data_rate ?: 125; /* SD */
-    im->tracklen_bc = (trk->data_rate * 400 * 300) / im->img.rpm;
+    im->img.data_rate = im->img.data_rate ?: 125; /* SD */
+    im->tracklen_bc = (im->img.data_rate * 400 * 300) / im->img.rpm;
 
     /* Calculate a suitable GAP3 if not specified. */
     if (trk->gap_3 == 0) {
@@ -1914,7 +1910,7 @@ static void fm_prep_track(struct image *im)
                           / im->tracklen_bc);
     im->img.gap_4 = (im->tracklen_bc - tracklen) / 16;
 
-    im->write_bc_ticks = sysclk_us(500) / trk->data_rate;
+    im->write_bc_ticks = sysclk_us(500) / im->img.data_rate;
 
     img_dump_info(im);
 }
