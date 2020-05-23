@@ -240,8 +240,12 @@ void led_7seg_write_string(const char *p)
             d[i] = letters[c - 'a'];
         } else if ((c >= 'A') && (c <= 'Z')) {
             d[i] = letters[c - 'A'];
+        } else if (c == '^') {
+            d[i] = 0x01;
         } else if (c == '-') {
             d[i] = 0x40;
+        } else if (c == '_') {
+            d[i] = 0x08;
         } else {
             d[i] = 0;
         }

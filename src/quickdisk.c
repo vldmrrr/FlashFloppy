@@ -55,8 +55,7 @@ static volatile struct {
 
 void floppy_cancel(void)
 {
-    struct drive *drv = &drive;
-
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
     /* Initialised? Bail if not. */
     if (!dma_rd)
         return;
@@ -72,8 +71,8 @@ void floppy_cancel(void)
     /* Stop DMA + timer work. */
     IRQx_disable(dma_rdata_irq);
     IRQx_disable(dma_wdata_irq);
-    rdata_stop();
-    wdata_stop();
+    rdata_stop(drv);
+    wdata_stop(drv);
     dma_rdata.ccr = 0;
     dma_wdata.ccr = 0;
 
@@ -88,16 +87,15 @@ void floppy_cancel(void)
     window.state = 0;
 }
 
-void floppy_set_fintf_mode(void)
+void floppy_set_fintf_mode(uint8_t unit)
 {
     /* Quick Disk interface is static. */
 }
 
-void floppy_init(void)
+void floppy_init()
 {
-    struct drive *drv = &drive;
-
-    floppy_set_fintf_mode();
+    struct drive *drv = unit ? &drive1 : &drive0;
+    floppy_set_fintf_mode(unit);
 
     printk("Interface: QuickDisk, JC=%s\n",
            !gpio_read_pin(gpiob, 1) ? "On (Roland)" : "Off");
@@ -122,12 +120,12 @@ void floppy_init(void)
 
     floppy_init_irqs();
 
-    timer_init(&index.timer, index_assert, NULL);
+    timer_init(&index.timer, index_assert, drv);
 }
 
 void floppy_insert(unsigned int unit, struct slot *slot)
 {
-    floppy_mount(slot);
+    floppy_mount(slot,unit);
 
     timer_dma_init();
     tim_rdata->ccr2 = sysclk_ns(1500); /* RD: 1.5us positive pulses */
@@ -141,10 +139,9 @@ void floppy_insert(unsigned int unit, struct slot *slot)
     IRQx_set_pending(motor_irq);
 }
 
-static void floppy_sync_flux(void)
+static void floppy_sync_flux(struct drive *drv)
 {
     const uint16_t buf_mask = ARRAY_SIZE(dma_rd->buf) - 1;
-    struct drive *drv = &drive;
     uint16_t nr_to_wrap, nr_to_cons, nr;
     uint32_t oldpri;
 
@@ -174,9 +171,9 @@ static void floppy_sync_flux(void)
 
     oldpri = IRQ_save(TIMER_IRQ_PRI);
     timer_cancel(&index.timer);
-    rdata_start();
+    rdata_start(drv);
     index.timer.deadline = time_now();
-    index_assert(NULL);
+    index_assert(drv);
     IRQ_restore(oldpri);
 }
 
@@ -197,7 +194,7 @@ static bool_t dma_rd_handle(struct drive *drv)
     }
 
     case DMA_starting:
-        floppy_sync_flux();
+        floppy_sync_flux(drv);
         /* fall through */
 
     case DMA_active:
@@ -218,7 +215,7 @@ static bool_t dma_rd_handle(struct drive *drv)
     return FALSE;
 }
 
-void floppy_get_track(struct track_info *ti)
+void floppy_get_track(struct track_info *ti, uint8_t unit)
 {
     ti->cyl = ti->side = 0;
     ti->sel = TRUE;
@@ -227,7 +224,7 @@ void floppy_get_track(struct track_info *ti)
 
 static void index_assert(void *dat)
 {
-    struct drive *drv = &drive;
+    struct drive *drv = (struct drive*)dat;
     struct window *w = &window;
     time_t now = index.timer.deadline;
 
@@ -242,7 +239,7 @@ static void index_assert(void *dat)
     } else {
 
         /* Disable RDATA. */
-        rdata_stop();
+        rdata_stop(drv);
 
         /* Window state machine is idle. */
         w->state = 0;

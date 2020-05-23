@@ -256,6 +256,8 @@ void mfm_ring_to_bin(const uint16_t *ring, unsigned int mask,
 #define FM_SYNC_CLK 0xc7
 uint16_t fm_sync(uint8_t dat, uint8_t clk);
 
+struct drive;
+
 /* External API. */
 void floppy_init(void);
 bool_t floppy_ribbon_is_reversed(void);
@@ -266,8 +268,8 @@ void floppy_set_cyl(uint8_t unit, uint8_t cyl);
 struct track_info {
     uint8_t cyl, side, sel, writing;
 };
-void floppy_get_track(struct track_info *ti);
-void floppy_set_fintf_mode(void);
+void floppy_get_track(struct track_info *ti, uint8_t unit);
+void floppy_set_fintf_mode(uint8_t unit);
 
 /*
  * Local variables:

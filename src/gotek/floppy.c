@@ -23,6 +23,9 @@
 #define pin_motor  15 /* PA15 or PB15 */
 #define pin_chgrst 14 /* PA14 if CHGRST_pa14 */
 
+#define pin_sel0_d  2 /* PA2 */
+#define pin_sel1_d  0 /* PA0 */
+
 /* Output pins. */
 #define gpio_out gpiob
 #define pin_02      7
@@ -95,8 +98,15 @@ static void board_floppy_init(void)
     afio->exticr3 = 0x1111;
     afio->exticr1 = 0x1100;
 
+    pins = m(pin_wgate) | m(pin_side) | m(pin_sel0);
+    if (ff_cfg.dual_unit) {
+        gpio_configure_pin(gpioa, pin_sel0_d, GPI_bus);
+        pins |= m(pin_sel0_d);
+        afio->exticr1 = 0x1000; /* SEL0=>PA2: PA[2:0] -> EXT[2:0] */
+    }
     if (gotek_enhanced()) {
         gpio_configure_pin(gpioa, pin_sel1,  GPI_bus);
+        pins |= m(pin_sel1);
         gpio_configure_pin(gpioa, pin_motor, GPI_bus);
     } else {
         /* This gives us "motor always on" if the pin is not connected. 
@@ -106,7 +116,6 @@ static void board_floppy_init(void)
         afio->exticr4 = 0x1011; /* Motor = PB15 */
     }
 
-    pins = m(pin_wgate) | m(pin_side) | m(pin_sel0);
     exti->rtsr = pins | m(pin_motor) | m(pin_step);
     exti->ftsr = pins | m(pin_motor) | m(pin_chgrst);
     exti->imr = pins | m(pin_step);
@@ -133,6 +142,9 @@ asm (
 "gpio_out_setreset: .word 0x40010c10\n" /* gpio_out->b[s]rr */
 "    .global IRQ_6\n"
 "    .thumb_set IRQ_6,IRQ_SELA_changed\n"
+"    .previous\n"
+"    .global IRQ_8\n"
+"    .thumb_set IRQ_8,IRQ_SELA_changed\n"
 "    .previous\n"
 );
 
@@ -163,11 +175,18 @@ static void Amiga_HD_ID(uint32_t _gpio_out_active, uint32_t _gpio_out_setreset)
  * speculative entry point for the next interrupt. */
 static void _IRQ_SELA_changed(uint32_t _gpio_out_active)
 {
-    /* Clear SELA-changed flag. */
-    exti->pr = m(pin_sel0);
+    uint8_t dual;
+    uint32_t mpin_sel0, mpin_sel1;
+    uint32_t idr = gpioa->idr;
+    /* Clear SEL-changed flag. */
+    exti->pr = m(pin_sel0) | m(pin_sel0_d);
+    
+    dual = ff_cfg.dual_unit;
+    mpin_sel0 = dual?m(pin_sel0_d):m(pin_sel0);
+    mpin_sel1 = dual ? m(pin_sel1_d) : m(pin_sel0);
 
-    if (!(gpioa->idr & m(pin_sel0))) {
-        /* SELA is asserted (this drive is selected). 
+    if (!(idr & (mpin_sel0|mpin_sel1))) {
+        /* SEL is asserted (this drive is selected). 
          * Immediately re-enable all our asserted outputs. */
         gpio_out->brr = _gpio_out_active;
         /* Set pin_rdata as timer output (AFO_bus). */
@@ -175,9 +194,10 @@ static void _IRQ_SELA_changed(uint32_t _gpio_out_active)
             gpio_data->crl = (gpio_data->crl & ~(0xfu<<(pin_rdata<<2)))
                 | ((AFO_bus&0xfu)<<(pin_rdata<<2));
         /* Let main code know it can drive the bus until further notice. */
-        drive.sel = 1;
+        drive0.sel = (!(idr & (mpin_sel0)))?1:0;
+        drive1.sel = (!(idr & (mpin_sel1)))?1:0;
     } else {
-        /* SELA is deasserted (this drive is not selected).
+        /* SEL is deasserted (this drive is not selected).
          * Relinquish the bus by disabling all our asserted outputs. */
         gpio_out->bsrr = _gpio_out_active;
         /* Set pin_rdata as quiescent (GPO_bus). */
@@ -185,11 +205,12 @@ static void _IRQ_SELA_changed(uint32_t _gpio_out_active)
             gpio_data->crl = (gpio_data->crl & ~(0xfu<<(pin_rdata<<2)))
                 | ((GPO_bus&0xfu)<<(pin_rdata<<2));
         /* Tell main code to leave the bus alone. */
-        drive.sel = 0;
+        drive0.sel = 0;
+        drive1.sel = 0;
     }
 
     /* Set up the speculative fast path for the next interrupt. */
-    if (drive.sel)
+    if (drive0.sel || drive1.sel)
         gpio_out_setreset &= ~4; /* gpio_out->bsrr */
     else
         gpio_out_setreset |= 4; /* gpio_out->brr */
@@ -233,7 +254,7 @@ static bool_t drive_is_writing(void)
 
 static void IRQ_STEP_changed(void)
 {
-    struct drive *drv = &drive;
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
     uint8_t idr_a, idr_b;
 
     /* Latch inputs. */
@@ -245,6 +266,8 @@ static void IRQ_STEP_changed(void)
 
     /* Bail if drive not selected. */
     if (idr_a & m(pin_sel0))
+        return;
+    if (ff_cfg.dual_unit && (idr_a & m(pin_sel0_d)))
         return;
 
     /* Deassert DSKCHG if a disk is inserted. */
@@ -268,7 +291,7 @@ static void IRQ_STEP_changed(void)
     if (drv->outp & m(outp_trk0))
         drive_change_output(drv, outp_trk0, FALSE);
     if (dma_rd != NULL) {
-        rdata_stop();
+        rdata_stop(drv);
         if (!ff_cfg.index_suppression) {
             /* Opportunistically insert an INDEX pulse ahead of seek op. */
             drive_change_output(drv, outp_index, TRUE);
@@ -282,7 +305,7 @@ static void IRQ_SIDE_changed(void)
 {
     stk_time_t t = stk_now();
     unsigned int filter = stk_us(ff_cfg.side_select_glitch_filter);
-    struct drive *drv = &drive;
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
     uint8_t hd;
 
     do {
@@ -301,12 +324,12 @@ static void IRQ_SIDE_changed(void)
 
     drv->head = hd;
     if ((dma_rd != NULL) && (drv->nr_sides == 2))
-        rdata_stop();
+        rdata_stop(drv);
 }
 
 static void IRQ_WGATE_changed(void)
 {
-    struct drive *drv = &drive;
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
 
     /* Clear WGATE-changed flag. */
     exti->pr = m(pin_wgate);
@@ -316,11 +339,11 @@ static void IRQ_WGATE_changed(void)
         return;
 
     if ((gpiob->idr & m(pin_wgate))      /* WGATE off? */
-        || (gpioa->idr & m(pin_sel0))) { /* Not selected? */
-        wdata_stop();
+        || (gpioa->idr & m(pin_sel0) || (ff_cfg.dual_unit && (gpioa->idr & m(pin_sel0_d))))) { /* Not selected? */
+        wdata_stop(drv);
     } else {
-        rdata_stop();
-        wdata_start();
+        rdata_stop(drv);
+        wdata_start(drv);
     }
 }
 
@@ -359,7 +382,7 @@ static void IRQ_CHGRST(struct drive *drv)
 
 static void IRQ_MOTOR_CHGRST(void)
 {
-    struct drive *drv = &drive;
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
     bool_t changed = drv->motor.changed;
     uint32_t pr = exti->pr;
 

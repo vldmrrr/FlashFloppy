@@ -159,6 +159,7 @@ struct packed ff_cfg {
 #define WDRAIN_realtime 1
 #define WDRAIN_eot      2
     uint8_t write_drain;
+    bool_t dual_unit;
 };
 
 extern struct ff_cfg ff_cfg;

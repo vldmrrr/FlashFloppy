@@ -12,7 +12,9 @@
 int EXC_reset(void) __attribute__((alias("main")));
 
 static const char image_a[] = "IMAGE_A.CFG";
+static const char image_b[] = "IMAGE_B.CFG";
 static const char init_image_a[] = "INIT_A.CFG";
+static const char init_image_b[] = "INIT_B.CFG";
 
 static FATFS fatfs;
 static struct {
@@ -30,7 +32,8 @@ struct native_dirent {
 };
 
 static struct {
-    uint16_t slot_nr, max_slot_nr;
+    uint16_t slot_nr[2];
+    uint16_t max_slot_nr;
     uint8_t slot_map[1000/8];
     union {
         struct { struct short_slot autoboot, hxcsdfe; };
@@ -61,6 +64,7 @@ static struct {
 #define cfg_scroll_reset TRUE
 
 uint8_t board_id;
+uint8_t c_unit = 0;
 
 #define BUTTON_SCAN_HZ 500
 #define BUTTON_SCAN_MS (1000/BUTTON_SCAN_HZ)
@@ -88,14 +92,14 @@ static bool_t slot_valid(unsigned int i)
 
 uint16_t get_slot_nr(void)
 {
-    return cfg.slot_nr;
+    return cfg.slot_nr[c_unit];
 }
 
 bool_t set_slot_nr(uint16_t slot_nr)
 {
     if (!slot_valid(slot_nr))
         return FALSE;
-    cfg.slot_nr = slot_nr;
+    cfg.slot_nr[c_unit] = slot_nr;
     cfg.dirty_slot_nr = TRUE;
     return TRUE;
 }
@@ -155,7 +159,7 @@ static void lcd_scroll_name(void)
     if ((lcd_scroll.ticks > 0) || (lcd_scroll.end == 0))
         return;
 
-    floppy_get_track(&ti);
+    floppy_get_track(&ti,c_unit);
     if (ti.cyl >= DA_FIRST_CYL) {
         /* Display controlled by src/image/da.c */
         return;
@@ -196,7 +200,7 @@ static void display_write_slot(bool_t nav_mode)
 
     if (display_mode != DM_LCD_OLED) {
         if (display_mode == DM_LED_7SEG)
-            led_7seg_write_decimal(cfg.slot_nr);
+            led_7seg_write_decimal(cfg.slot_nr[c_unit]);
         return;
     }
 
@@ -229,7 +233,7 @@ static void display_write_slot(bool_t nav_mode)
     }
 
     snprintf(msg, sizeof(msg), "%03u/%03u%*s%3s D:%u",
-             cfg.slot_nr, cfg.max_slot_nr,
+             cfg.slot_nr[c_unit], cfg.max_slot_nr,
              (lcd_columns > 16) ? 3 : 1, "",
              typename, cfg.depth);
 
@@ -254,7 +258,7 @@ static void lcd_write_track_info(bool_t force)
     if (display_mode != DM_LCD_OLED)
         return;
 
-    floppy_get_track(&ti);
+    floppy_get_track(&ti,c_unit);
 
     if (lcd_columns <= 16)
         ti.cyl = min_t(uint8_t, ti.cyl, 99);
@@ -288,7 +292,7 @@ static void led_7seg_update_track(bool_t force)
     if (display_mode != DM_LED_7SEG)
         return;
 
-    floppy_get_track(&ti);
+    floppy_get_track(&ti,c_unit);
     changed = (ti.cyl != led_ti.cyl) || ((ti.side != led_ti.side) && ti.sel)
         || (ti.writing != led_ti.writing);
 
@@ -961,6 +965,10 @@ static void read_ff_cfg(void)
                 : CHGRST_step;
             break;
 
+        case FFCFG_dual_unit:
+            ff_cfg.dual_unit = !strcmp(opts.arg, "yes");
+            break;
+
             /* STARTUP / INITIALISATION */
 
         case FFCFG_ejected_on_startup:
@@ -1204,7 +1212,7 @@ static void process_ff_cfg_opts(const struct ff_cfg *old)
     if ((ff_cfg.interface != old->interface)
         || (ff_cfg.pin02 != old->pin02)
         || (ff_cfg.pin34 != old->pin34))
-        floppy_set_fintf_mode();
+        floppy_set_fintf_mode(c_unit);
 
     /* ejected-on-startup: Set the ejected state appropriately. */
     if (ff_cfg.ejected_on_startup)
@@ -1217,26 +1225,14 @@ static void process_ff_cfg_opts(const struct ff_cfg *old)
         system_reset(); /* hit it with a hammer */
 }
 
-static void cfg_init(void)
-{
-    struct ff_cfg old_ff_cfg = ff_cfg;
+static void cfg_init_slot(uint8_t unit) {
     struct hxcsdfe_cfg *hxc_cfg;
     unsigned int sofar;
     char *p;
     FRESULT fr;
 
-    cfg.dirty_slot_nr = FALSE;
-    cfg.dirty_slot_name = FALSE;
-    cfg.hxc_mode = FALSE;
-    cfg.ima_ej_flag = FALSE;
-    cfg.slot_nr = cfg.depth = 0;
-    cfg.cur_cdir = fatfs.cdir;
-
     fr = f_chdir("FF");
     cfg.cfg_cdir = fatfs.cdir;
-
-    read_ff_cfg();
-    process_ff_cfg_opts(&old_ff_cfg);
 
     switch (ff_cfg.nav_mode) {
     case NAVMODE_native:
@@ -1247,6 +1243,8 @@ static void cfg_init(void)
     default:
         break;
     }
+    if (unit)
+        return;
 
     /* Probe for HxC compatibility mode. */
     fatfs.cdir = cfg.cur_cdir;
@@ -1297,7 +1295,7 @@ native_mode:
 
     sofar = 0;
     if (ff_cfg.image_on_startup == IMGS_static) {
-        fr = F_try_open(&fs->file, init_image_a, FA_READ);
+        fr = F_try_open(&fs->file, unit?init_image_b:init_image_a, FA_READ);
         if (!fr) {
             sofar = min_t(unsigned int, f_size(&fs->file), sizeof(fs->buf));
             F_read(&fs->file, fs->buf, sofar, NULL);
@@ -1305,7 +1303,7 @@ native_mode:
         }
     }
 
-    F_open(&fs->file, image_a, FA_READ | FA_WRITE | FA_OPEN_ALWAYS);
+    F_open(&fs->file, unit?image_b:image_a, FA_READ | FA_WRITE | FA_OPEN_ALWAYS);
 
     if (ff_cfg.image_on_startup != IMGS_last) {
         F_lseek(&fs->file, 0);
@@ -1365,7 +1363,7 @@ native_mode:
         if (display_mode != DM_LCD_OLED)
             goto clear_image_a; /* no subfolder support on LED display */
         /* Skip '..' entry. */
-        cfg.slot_nr = 1;
+        cfg.slot_nr[unit] = 1;
     }
     while ((p != fs->buf) && isspace(p[-1]))
         *--p = '\0'; /* Strip trailing whitespace */
@@ -1385,16 +1383,16 @@ native_mode:
                cfg.ima_ej_flag ? "(EJ)" : "");
         native_get_slot_map(TRUE);
         if (cfg.sorted) {
-            nr = cfg.max_slot_nr + 1 - cfg.slot_nr;
+            nr = cfg.max_slot_nr + 1 - cfg.slot_nr[unit];
             for (i = 0; i < nr; i++)
                 if (!strcmp(cfg.sorted[i]->name, fs->buf))
                     break;
             ok = (i < nr);
-            cfg.slot_nr += i;
+            cfg.slot_nr[unit] += i;
         } else {
             F_opendir(&fs->dp, "");
             while ((ok = native_dir_next()) && strcmp(fs->fp.fname, fs->buf))
-                cfg.slot_nr++;
+                cfg.slot_nr[unit]++;
             F_closedir(&fs->dp);
         }
         if (!ok)
@@ -1410,14 +1408,36 @@ out:
 
 clear_image_a:
     /* Error! Clear the IMAGE_A.CFG file. */
-    printk("IMAGE_A.CFG is bad: clearing it\n");
+    printk("IMAGE_%s.CFG is bad: clearing it\n",unit?"B":"A");
     F_lseek(&fs->file, 0);
     lcd_write(0, 3, -1, "/");
     F_truncate(&fs->file);
     F_close(&fs->file);
-    cfg.slot_nr = cfg.depth = 0;
+    cfg.slot_nr[0] = cfg.slot_nr[1] = cfg.depth = 0;
     cfg.ima_ej_flag = FALSE;
     goto out;
+}
+
+static void cfg_init(void)
+{
+    struct ff_cfg old_ff_cfg = ff_cfg;
+
+    cfg.dirty_slot_nr = FALSE;
+    cfg.dirty_slot_name = FALSE;
+    cfg.hxc_mode = FALSE;
+    cfg.ima_ej_flag = FALSE;
+    cfg.slot_nr[0] = cfg.slot_nr[1] = cfg.depth = 0;
+    cfg.cur_cdir = fatfs.cdir;
+
+    f_chdir("FF");
+    cfg.cfg_cdir = fatfs.cdir;
+
+    read_ff_cfg();
+    process_ff_cfg_opts(&old_ff_cfg);
+
+    cfg_init_slot(0);
+    if (ff_cfg.dual_unit)
+        cfg_init_slot(1);
 }
 
 static void native_get_slot_map(bool_t sorted_only)
@@ -1445,7 +1465,7 @@ static void native_get_slot_map(bool_t sorted_only)
     cfg.max_slot_nr--;
 
     /* Select last disk_index if not greater than available slots. */
-    cfg.slot_nr = (cfg.slot_nr <= cfg.max_slot_nr) ? cfg.slot_nr : 0;
+    cfg.slot_nr[c_unit] = (cfg.slot_nr[c_unit] <= cfg.max_slot_nr) ? cfg.slot_nr[c_unit] : 0;
 }
 
 #define CFG_KEEP_SLOT_NR  0 /* Do not re-read slot number from config */
@@ -1462,7 +1482,7 @@ static void native_update(uint8_t slot_mode)
     if (slot_mode == CFG_WRITE_SLOT_NR) {
         char *p, *q;
         fatfs.cdir = cfg.cfg_cdir;
-        F_open(&fs->file, image_a, FA_READ|FA_WRITE);
+        F_open(&fs->file, c_unit?image_b:image_a, FA_READ|FA_WRITE);
         printk("Before: "); dump_file();
         /* Read final section of the file. */
         if (f_size(&fs->file) > sizeof(fs->buf))
@@ -1520,7 +1540,7 @@ static void native_update(uint8_t slot_mode)
     }
     
     /* Populate current slot. */
-    if ((i = cfg.depth ? 1 : 0) > cfg.slot_nr) {
+    if ((i = cfg.depth ? 1 : 0) > cfg.slot_nr[c_unit]) {
         /* Must be the ".." folder. */
         snprintf(fs->fp.fname, sizeof(fs->fp.fname), "..");
         fs->fp.fattrib = AM_DIR;
@@ -1529,7 +1549,7 @@ static void native_update(uint8_t slot_mode)
 
     if (cfg.sorted) {
 
-        struct native_dirent *ent = cfg.sorted[cfg.slot_nr-i];
+        struct native_dirent *ent = cfg.sorted[cfg.slot_nr[c_unit]-i];
         snprintf(fs->fp.fname, sizeof(fs->fp.fname), ent->name);
         fs->file.obj.fs = &fatfs;
         fs->file.dir_sect = ent->dir_sect;
@@ -1544,7 +1564,7 @@ static void native_update(uint8_t slot_mode)
 
         F_opendir(&fs->dp, "");
         while (native_dir_next()) {
-            if (i >= cfg.slot_nr)
+            if (i >= cfg.slot_nr[c_unit])
                 break;
             i++;
         }
@@ -1571,7 +1591,7 @@ static void ima_mark_ejected(bool_t ej)
         return;
 
     fatfs.cdir = cfg.cfg_cdir;
-    F_open(&fs->file, image_a, FA_READ|FA_WRITE);
+    F_open(&fs->file, c_unit?image_b:image_a, FA_READ|FA_WRITE);
     printk("Before: "); dump_file();
     if (ej) {
         F_lseek(&fs->file, f_size(&fs->file));
@@ -1606,21 +1626,21 @@ static void hxc_cfg_update(uint8_t slot_mode)
         fatfs.cdir = cfg.cfg_cdir;
         switch (slot_mode) {
         case CFG_READ_SLOT_NR:
-            cfg.slot_nr = 0;
+            cfg.slot_nr[c_unit] = 0;
             if (ff_cfg.image_on_startup == IMGS_init)
                 break;
-            if ((fr = F_try_open(&fs->file, image_a, FA_READ)) != FR_OK)
+            if ((fr = F_try_open(&fs->file, c_unit?image_b:image_a, FA_READ)) != FR_OK)
                 break;
             F_read(&fs->file, slot, sizeof(slot), NULL);
             F_close(&fs->file);
             slot[sizeof(slot)-1] = '\0';
-            cfg.slot_nr = strtol(slot, NULL, 10);
+            cfg.slot_nr[c_unit] = strtol(slot, NULL, 10);
             break;
         case CFG_WRITE_SLOT_NR:
             if (ff_cfg.image_on_startup != IMGS_last)
                 break;
-            snprintf(slot, sizeof(slot), "%u", cfg.slot_nr);
-            F_open(&fs->file, image_a, FA_WRITE | FA_OPEN_ALWAYS);
+            snprintf(slot, sizeof(slot), "%u", cfg.slot_nr[c_unit]);
+            F_open(&fs->file, c_unit?image_b:image_a, FA_WRITE | FA_OPEN_ALWAYS);
             F_write(&fs->file, slot, strnlen(slot, sizeof(slot)), NULL);
             F_truncate(&fs->file);
             F_close(&fs->file);
@@ -1653,14 +1673,14 @@ static void hxc_cfg_update(uint8_t slot_mode)
     case 1: {
         if (slot_mode != CFG_READ_SLOT_NR) {
             /* Keep the already-configured slot number. */
-            hxc->cfg.slot_index = cfg.slot_nr;
+            hxc->cfg.slot_index = cfg.slot_nr[c_unit];
             if (slot_mode == CFG_WRITE_SLOT_NR) {
                 /* Update the config file with new slot number. */
                 F_lseek(&fs->file, 0);
                 F_write(&fs->file, &hxc->cfg, sizeof(hxc->cfg), NULL);
             }
         }
-        cfg.slot_nr = hxc->cfg.slot_index;
+        cfg.slot_nr[c_unit] = hxc->cfg.slot_index;
         if (hxc->cfg.index_mode)
             break;
         /* Slot mode: initialise slot map and current slot. */
@@ -1669,10 +1689,10 @@ static void hxc_cfg_update(uint8_t slot_mode)
             memset(&cfg.slot_map, 0xff, sizeof(cfg.slot_map));
         }
         /* Slot mode: read current slot file info. */
-        if (cfg.slot_nr == 0) {
+        if (cfg.slot_nr[c_unit] == 0) {
             slot_from_short_slot(&cfg.slot, &cfg.autoboot);
         } else {
-            F_lseek(&fs->file, 1024 + cfg.slot_nr*128);
+            F_lseek(&fs->file, 1024 + cfg.slot_nr[c_unit]*128);
             F_read(&fs->file, &hxc->v1_slot, sizeof(hxc->v1_slot), NULL);
             memcpy(&hxc->v2_slot.type, &hxc->v1_slot.name[8], 3);
             memcpy(&hxc->v2_slot.attributes, &hxc->v1_slot.attributes,
@@ -1685,13 +1705,13 @@ static void hxc_cfg_update(uint8_t slot_mode)
 
     case 2:
         if (slot_mode != CFG_READ_SLOT_NR) {
-            hxc->cfg.cur_slot_number = cfg.slot_nr;
+            hxc->cfg.cur_slot_number = cfg.slot_nr[c_unit];
             if (slot_mode == CFG_WRITE_SLOT_NR) {
                 F_lseek(&fs->file, 0);
                 F_write(&fs->file, &hxc->cfg, sizeof(hxc->cfg), NULL);
             }
         }
-        cfg.slot_nr = hxc->cfg.cur_slot_number;
+        cfg.slot_nr[c_unit] = hxc->cfg.cur_slot_number;
         if (hxc->cfg.index_mode)
             break;
         /* Slot mode: initialise slot map and current slot. */
@@ -1705,11 +1725,11 @@ static void hxc_cfg_update(uint8_t slot_mode)
                 cfg.max_slot_nr--;
         }
         /* Slot mode: read current slot file info. */
-        if (cfg.slot_nr == 0) {
+        if (cfg.slot_nr[c_unit] == 0) {
             slot_from_short_slot(&cfg.slot, &cfg.autoboot);
         } else {
             F_lseek(&fs->file, hxc->cfg.slots_position*512
-                    + cfg.slot_nr*64*hxc->cfg.number_of_drive_per_slot);
+                    + cfg.slot_nr[c_unit]*64*hxc->cfg.number_of_drive_per_slot);
             F_read(&fs->file, &hxc->v2_slot, sizeof(hxc->v2_slot), NULL);
             slot_from_short_slot(&cfg.slot, &hxc->v2_slot);
         }
@@ -1769,7 +1789,7 @@ indexed_mode:
 
         /* Index mode: populate current slot. */
         snprintf(name, sizeof(name), "%s%04u*.*",
-                 ff_cfg.indexed_prefix, cfg.slot_nr);
+                 ff_cfg.indexed_prefix, cfg.slot_nr[c_unit]);
         printk("[%s]\n", name);
         F_findfirst(&fs->dp, &fs->fp, "", name);
         F_closedir(&fs->dp);
@@ -1812,13 +1832,26 @@ static void cfg_update(uint8_t slot_mode)
         cfg.slot.attributes |= AM_RDO;
 }
 
+static bool_t wait_button_release(uint8_t btn)
+{
+    time_t then = time_now();
+    while ((time_diff(then, time_now()) < time_ms(1000)))
+    {
+        if (buttons == btn)
+            continue;
+        break;
+    }
+    return (buttons == 0);
+}
+
 /* Based on button presses, change which floppy image is selected. */
 static bool_t choose_new_image(uint8_t init_b)
 {
     uint8_t b, prev_b;
     time_t last_change = 0;
-    int old_slot = cfg.slot_nr, i, changes = 0;
+    int old_slot = cfg.slot_nr[c_unit], i, changes = 0;
     uint8_t twobutton_action = ff_cfg.twobutton_action & TWOBUTTON_mask;
+    bool_t switch_unit = FALSE;
 
     for (prev_b = 0, b = init_b;
          (b &= (B_LEFT|B_RIGHT)) != 0;
@@ -1841,15 +1874,22 @@ static bool_t choose_new_image(uint8_t init_b)
         }
         last_change = time_now();
 
-        i = cfg.slot_nr;
+        i = cfg.slot_nr[c_unit];
         if (!(b ^ (B_LEFT|B_RIGHT))) {
-            if (twobutton_action == TWOBUTTON_eject) {
-                cfg.slot_nr = old_slot;
+            if (ff_cfg.dual_unit && changes == 0) {
+                    switch_unit = TRUE;
+                    continue; // wait for long press
+            }
+            if ( ff_cfg.dual_unit  // long press
+                || twobutton_action == TWOBUTTON_eject)
+            {
+                cfg.slot_nr[c_unit] = old_slot;
                 cfg.ejected = TRUE;
                 cfg_update(CFG_KEEP_SLOT_NR);
+                switch_unit = FALSE;
                 break;
             }
-            i = cfg.slot_nr = 0;
+            i = cfg.slot_nr[c_unit] = 0;
             cfg_update(CFG_KEEP_SLOT_NR);
             if ((twobutton_action == TWOBUTTON_rotary)
                 || (twobutton_action == TWOBUTTON_rotary_fast)) {
@@ -1866,6 +1906,13 @@ static bool_t choose_new_image(uint8_t init_b)
             while ((time_diff(last_change, time_now()) < time_ms(1000))
                    && buttons)
                 continue;
+        } else if (switch_unit) {
+            if (wait_button_release(b))
+                break;
+            else {
+                switch_unit = FALSE;
+                continue;
+            }
         } else if (b & B_LEFT) {
         b_left:
             do {
@@ -1874,6 +1921,8 @@ static bool_t choose_new_image(uint8_t init_b)
                         goto b_right;
                     i = cfg.max_slot_nr;
                 }
+                if (i == cfg.slot_nr[(c_unit + 1) & 1])
+                    goto b_left;
             } while (!slot_valid(i));
         } else { /* b & B_RIGHT */
         b_right:
@@ -1883,14 +1932,21 @@ static bool_t choose_new_image(uint8_t init_b)
                         goto b_left;
                     i = 0;
                 }
+                if (i == cfg.slot_nr[(c_unit + 1) & 1])
+                    goto b_right;
             } while (!slot_valid(i));
         }
 
-        cfg.slot_nr = i;
+        cfg.slot_nr[c_unit] = i;
         cfg_update(CFG_KEEP_SLOT_NR);
         display_write_slot(TRUE);
     }
 
+    if (switch_unit) {
+        c_unit = (c_unit+1)&1;
+        led_7seg_write_string(c_unit?"^^^":"___");
+        return TRUE;
+    }
     return FALSE;
 }
 
@@ -1906,7 +1962,7 @@ static int run_floppy(void *_b)
     time_t t_now, t_prev, t_diff;
     int32_t update_ticks;
 
-    floppy_insert(0, &cfg.slot);
+    floppy_insert(c_unit, &cfg.slot);
 
     led_7seg_update_track(TRUE);
 
@@ -2006,7 +2062,7 @@ static uint8_t menu_wait_button(bool_t twobutton_eject, const char *led_msg)
             if ((++wait % 1000) == 0) {
                 switch (wait / 1000) {
                 case 1:
-                    led_7seg_write_decimal(cfg.slot_nr);
+                    led_7seg_write_decimal(cfg.slot_nr[c_unit]);
                     break;
                 default:
                     led_7seg_write_string(led_msg);
@@ -2184,7 +2240,7 @@ static bool_t image_delete(void)
         t = time_now();
     }
 
-    cfg.slot_nr = min_t(uint16_t, cfg.slot_nr, cfg.max_slot_nr-1);
+    cfg.slot_nr[c_unit] = min_t(uint16_t, cfg.slot_nr[c_unit], cfg.max_slot_nr - 1);
     cfg.sorted = NULL;
     cfg_update(CFG_READ_SLOT_NR);
     ok = TRUE;
@@ -2355,13 +2411,13 @@ static int floppy_main(void *unused)
 
         /* Make sure slot index is on a valid slot. Find next valid slot if 
          * not (and update config). */
-        i = cfg.slot_nr;
+        i = cfg.slot_nr[c_unit];
         if (!slot_valid(i)) {
             while (!slot_valid(i))
                 if (i++ >= cfg.max_slot_nr)
                     i = 0;
-            printk("Updated slot %u -> %u\n", cfg.slot_nr, i);
-            cfg.slot_nr = i;
+            printk("Updated slot %u -> %u\n", cfg.slot_nr[c_unit], i);
+            cfg.slot_nr[c_unit] = i;
             cfg_update(CFG_WRITE_SLOT_NR);
         }
 
@@ -2374,15 +2430,15 @@ static int floppy_main(void *unused)
                 if (cfg.depth == 0)
                     F_die(FR_BAD_IMAGECFG);
                 fatfs.cdir = cfg.cur_cdir = cfg.stack[--cfg.depth].cdir;
-                cfg.slot_nr = cfg.stack[cfg.depth].slot;
+                cfg.slot_nr[c_unit] = cfg.stack[cfg.depth].slot;
             } else {
                 if (cfg.depth == ARRAY_SIZE(cfg.stack))
                     F_die(FR_PATH_TOO_DEEP);
-                cfg.stack[cfg.depth].slot = cfg.slot_nr;
+                cfg.stack[cfg.depth].slot = cfg.slot_nr[c_unit];
                 cfg.stack[cfg.depth++].cdir = cfg.cur_cdir;
                 F_chdir(fs->fp.fname);
                 cfg.cur_cdir = fatfs.cdir;
-                cfg.slot_nr = 1;
+                cfg.slot_nr[c_unit] = 1;
             }
             cfg.sorted = NULL;
             cfg_update(CFG_READ_SLOT_NR);
@@ -2395,7 +2451,7 @@ static int floppy_main(void *unused)
         if (display_mode == DM_LCD_OLED)
             lcd_write_track_info(TRUE);
 
-        printk("Current slot: %u/%u\n", cfg.slot_nr, cfg.max_slot_nr);
+        printk("Current slot: %u/%u\n", cfg.slot_nr[c_unit], cfg.max_slot_nr);
         printk("Name: '%s' Type: %s\n", cfg.slot.name, cfg.slot.type);
         printk("Attr: %02x Clus: %08x Size: %u\n",
                cfg.slot.attributes, cfg.slot.firstCluster, cfg.slot.size);
@@ -2825,10 +2881,12 @@ int main(void)
     printk("Build: %s %s\n", build_date, build_time);
     printk("Board: %s\n", board_name[board_id]);
 
-    speaker_init();
 
     flash_ff_cfg_read();
 
+    if (!ff_cfg.dual_unit) // sel0 on the same pin as speaker
+        speaker_init();
+    
     floppy_init();
 
     display_init();

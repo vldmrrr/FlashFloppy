@@ -81,6 +81,7 @@ static void board_floppy_init(void)
 
 static void IRQ_WGATE_changed(void)
 {
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
     /* Clear WGATE-changed flag. */
     exti->pr = m(pin_wgate);
 
@@ -90,11 +91,11 @@ static void IRQ_WGATE_changed(void)
 
     if (!(gpiob->idr & m(pin_wgate)) || read_pin(ready)) {
         /* !WG || !/RY */
-        wdata_stop();
+        wdata_stop(drv);
     } else {
         /* WG && /RY */
-        rdata_stop();
-        wdata_start();
+        rdata_stop(drv);
+        wdata_start(drv);
     }
 }
 

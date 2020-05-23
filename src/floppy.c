@@ -146,7 +146,7 @@ static void update_amiga_id(struct drive *drv, bool_t amiga_hd_id)
      * starting with pin 34 asserted when the HD image is mounted seems to
      * generally work! */
     gpio_out_active |= m(pin_34);
-    if (drive.sel)
+    if (drive0.sel || drive1.sel)
         gpio_write_pins(gpio_out, m(pin_34), O_TRUE);
 
     IRQ_global_enable();
@@ -154,8 +154,7 @@ static void update_amiga_id(struct drive *drv, bool_t amiga_hd_id)
 
 void floppy_cancel(void)
 {
-    struct drive *drv = &drive;
-
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
     /* Initialised? Bail if not. */
     if (!dma_rd)
         return;
@@ -169,8 +168,8 @@ void floppy_cancel(void)
     /* Stop DMA + timer work. */
     IRQx_disable(dma_rdata_irq);
     IRQx_disable(dma_wdata_irq);
-    rdata_stop();
-    wdata_stop();
+    rdata_stop(drv);
+    wdata_stop(drv);
     dma_rdata.ccr = 0;
     dma_wdata.ccr = 0;
 
@@ -260,7 +259,7 @@ void floppy_set_fintf_mode(void)
 
 void floppy_init(void)
 {
-    struct drive *drv = &drive;
+    struct drive *drv = &drive0;
 
     floppy_set_fintf_mode();
 
@@ -269,8 +268,13 @@ void floppy_init(void)
     timer_init(&drv->step.timer, drive_step_timer, drv);
     timer_init(&drv->motor.timer, motor_spinup_timer, drv);
     timer_init(&drv->chgrst_timer, chgrst_timer, drv);
+    if (ff_cfg.dual_unit) {
+        timer_init(&drive1.step.timer, drive_step_timer, drv);
+        timer_init(&drive1.motor.timer, motor_spinup_timer, drv);
+        timer_init(&drive1.chgrst_timer, chgrst_timer, drv);
+    }
 
-    gpio_configure_pin(gpio_out, pin_02, GPO_bus);
+        gpio_configure_pin(gpio_out, pin_02, GPO_bus);
     gpio_configure_pin(gpio_out, pin_08, GPO_bus);
     gpio_configure_pin(gpio_out, pin_26, GPO_bus);
     gpio_configure_pin(gpio_out, pin_28, GPO_bus);
@@ -296,13 +300,13 @@ void floppy_init(void)
 
 void floppy_insert(unsigned int unit, struct slot *slot)
 {
+    struct drive *drv = unit ? &drive1 : &drive0;
     struct image *im;
-    struct drive *drv = &drive;
 
     /* Report only significant prefetch times (> 10ms). */
     max_prefetch_us = 10000;
 
-    floppy_mount(slot);
+    floppy_mount(slot,unit);
     im = image;
 
     if (im->write_bc_ticks < sysclk_ns(1500))
@@ -321,10 +325,9 @@ void floppy_insert(unsigned int unit, struct slot *slot)
         timer_set(&drv->chgrst_timer, time_now() + ff_cfg.chgrst*time_ms(500));
 }
 
-static void floppy_sync_flux(void)
+static void floppy_sync_flux(struct drive* drv)
 {
     const uint16_t buf_mask = ARRAY_SIZE(dma_rd->buf) - 1;
-    struct drive *drv = &drive;
     uint32_t prefetch_us;
     uint16_t nr_to_wrap, nr_to_cons, nr;
     int32_t ticks;
@@ -418,7 +421,7 @@ static void floppy_sync_flux(void)
         drv->index_suppressed = FALSE;
     }
 
-    rdata_start();
+    rdata_start(drv);
 }
 
 static bool_t dma_rd_handle(struct drive *drv)
@@ -444,7 +447,7 @@ static bool_t dma_rd_handle(struct drive *drv)
         /* Work out where in new track to start reading data from. */
         index_time = index.prev_time;
         read_start_pos = drv->index_suppressed
-            ? drive.restart_pos /* start read exactly where write ended */
+            ? drv->restart_pos /* start read exactly where write ended */
             : time_since(index_time) + delay;
         read_start_pos %= drv->image->stk_per_rev;
         /* Seek to the new track. */
@@ -477,7 +480,7 @@ static bool_t dma_rd_handle(struct drive *drv)
     }
 
     case DMA_starting:
-        floppy_sync_flux();
+        floppy_sync_flux(drv);
         /* fall through */
 
     case DMA_active:
@@ -500,19 +503,18 @@ static bool_t dma_rd_handle(struct drive *drv)
 
 void floppy_set_cyl(uint8_t unit, uint8_t cyl)
 {
-    if (unit == 0) {
-        struct drive *drv = &drive;
-        drv->cyl = cyl;
-        if (cyl == 0)
-            drive_change_output(drv, outp_trk0, TRUE);
-    }
+    struct drive *drv = unit ? &drive1 : &drive0;
+    drv->cyl = cyl;
+    if (cyl == 0)
+        drive_change_output(drv, outp_trk0, TRUE);
 }
 
-void floppy_get_track(struct track_info *ti)
+void floppy_get_track(struct track_info *ti, uint8_t unit)
 {
-    ti->cyl = drive.cyl;
-    ti->side = drive.head & (drive.nr_sides - 1);
-    ti->sel = drive.sel;
+    struct drive *drv = unit ? &drive1 : &drive0;
+    ti->cyl = drv->cyl;
+    ti->side = drv->head & (drv->nr_sides - 1);
+    ti->sel = drv->sel;
     ti->writing = (dma_wr && dma_wr->state != DMA_inactive);
 }
 
@@ -536,7 +538,7 @@ static bool_t index_is_suppressed(struct drive *drv)
 
 static void index_assert(void *dat)
 {
-    struct drive *drv = &drive;
+    struct drive* drv = (struct drive*)dat;
     index.prev_time = index.timer.deadline;
     if (drv->motor.on && !index_is_suppressed(drv)) {
         drive_change_output(drv, outp_index, TRUE);
@@ -548,7 +550,7 @@ static void index_assert(void *dat)
 
 static void index_deassert(void *dat)
 {
-    struct drive *drv = &drive;
+    struct drive *drv = (struct drive *)dat;
     drive_change_output(drv, outp_index, FALSE);
 }
 
@@ -567,7 +569,8 @@ static void drive_step_timer(void *_drv)
         /* nothing to do, IRQ_soft() needs to reset our deadline */
         break;
     case STEP_latched:
-        speaker_pulse();
+        if (!ff_cfg.dual_unit) // sel0 on the same pin as speaker
+            speaker_pulse();
         if ((drv->cyl >= 84) && !drv->step.inward)
             drv->cyl = 84; /* Fast step back from D-A cyls */
         drv->cyl += drv->step.inward ? 1 : -1;
@@ -594,10 +597,8 @@ static void motor_spinup_timer(void *_drv)
     drive_change_output(drv, outp_rdy, TRUE);
 }
 
-static void IRQ_soft(void)
+static void IRQ_soft(struct drive* drv)
 {
-    struct drive *drv = &drive;
-
     if (drv->step.state == STEP_started) {
         timer_cancel(&drv->step.timer);
         drv->step.state = STEP_latched;

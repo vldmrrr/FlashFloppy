@@ -1,5 +1,5 @@
 
-export FW_VER := 3.13a
+export FW_VER := 3.13d
 
 PROJ := FlashFloppy
 VER := v$(FW_VER)
@@ -30,6 +30,20 @@ gotek: all
 HXC_FF_URL := https://www.github.com/keirf/HxC_FF_File_Selector
 HXC_FF_URL := $(HXC_FF_URL)/releases/download
 HXC_FF_VER := v8-FF
+
+gotek_test:
+	rm -rf flashfloppy-*
+	mkdir -p flashfloppy-$(VER)/alt/bootloader
+	mkdir -p flashfloppy-$(VER)/alt/logfile
+	mkdir -p flashfloppy-$(VER)/alt/io-test
+	mkdir -p flashfloppy-$(VER)/alt/quickdisk/logfile
+	$(MAKE) clean
+	$(MAKE) gotek
+	cp -a FF_Gotek-$(VER).dfu flashfloppy-$(VER)/
+	cp -a FF_Gotek-$(VER).upd flashfloppy-$(VER)/
+	cp -a FF_Gotek-$(VER).hex flashfloppy-$(VER)/
+	cp -a FF_Gotek-Bootloader-$(VER).upd flashfloppy-$(VER)/alt/bootloader/
+	cp -a FF_Gotek-IO-Test-$(VER).upd flashfloppy-$(VER)/alt/io-test/
 
 dist:
 	rm -rf flashfloppy-*
@@ -77,10 +91,12 @@ else
 
 upd:
 	$(MAKE) -C src -f $(ROOT)/Rules.mk $(PROJ).elf $(PROJ).bin $(PROJ).hex
+	cp src/$(PROJ).elf .bin/
 	$(PYTHON) ./scripts/mk_update.py src/$(PROJ).bin FF.upd
 
 all:
 	$(MAKE) -C src -f $(ROOT)/Rules.mk $(PROJ).elf $(PROJ).bin $(PROJ).hex
+	cp src/$(PROJ).elf .bin/
 	bootloader=y debug=n logfile=n $(MAKE) -C bootloader \
 		-f $(ROOT)/Rules.mk \
 		Bootloader.elf Bootloader.bin Bootloader.hex

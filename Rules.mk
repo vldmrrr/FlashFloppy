@@ -50,6 +50,8 @@ include Makefile
 SUBDIRS += $(SUBDIRS-y)
 OBJS += $(OBJS-y) $(patsubst %,%/build.o,$(SUBDIRS))
 
+SRCDIR := $(shell python -c "import os.path; print os.path.relpath('$(CURDIR)','$(ROOT)')")
+
 # Force execution of pattern rules (for which PHONY cannot be directly used).
 .PHONY: FORCE
 FORCE:
@@ -64,9 +66,11 @@ build.o: $(OBJS)
 %/build.o: FORCE
 	$(MAKE) -f $(ROOT)/Rules.mk -C $* build.o
 
+.ONESHELL:
 %.o: %.c Makefile
-	@echo CC $@
-	$(CC) $(CFLAGS) -c $< -o $@
+	@echo $(CC) $(CFLAGS) -c $(SRCDIR)/$< -o $(SRCDIR)/$@
+	cd $(ROOT)
+	$(CC) $(CFLAGS) -c $(SRCDIR)/$< -o $(SRCDIR)/$@
 
 %.o: %.S Makefile
 	@echo AS $@

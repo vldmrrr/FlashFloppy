@@ -73,7 +73,7 @@ static struct drive {
     } step;
     uint32_t restart_pos;
     struct image *image;
-} drive;
+} drive0, drive1, *active_driver = null;
 
 static struct image *image;
 
@@ -83,9 +83,9 @@ static struct {
     bool_t fake_fired;
 } index;
 
-static void rdata_stop(void);
-static void wdata_start(void);
-static void wdata_stop(void);
+static void rdata_stop(struct drive *drv);
+static void wdata_start(struct drive *drv);
+static void wdata_stop(struct drive *drv);
 
 struct exti_irq {
     uint8_t irq, pri;
@@ -136,11 +136,11 @@ static struct dma_ring *dma_ring_alloc(void)
 
 /* Allocate floppy resources and mount the given image. 
  * On return: dma_rd, dma_wr, image and index are all valid. */
-static void floppy_mount(struct slot *slot)
+static void floppy_mount(struct slot *slot, int unit)
 {
+    struct drive *drv = unit ? &drive1 : &drive0;
     struct image *im;
     struct dma_ring *_dma_rd, *_dma_wr;
-    struct drive *drv = &drive;
     FSIZE_t fastseek_sz;
     DWORD *cltbl;
     FRESULT fr;
@@ -322,10 +322,9 @@ static void drive_set_restart_pos(struct drive *drv)
 }
 
 /* Called from IRQ context to stop the write stream. */
-static void wdata_stop(void)
+static void wdata_stop(struct drive *drv)
 {
     struct write *write;
-    struct drive *drv = &drive;
     uint8_t prev_state = dma_wr->state;
 
     /* Already inactive? Nothing to do. */
@@ -376,7 +375,7 @@ static void wdata_stop(void)
 #endif
 }
 
-static void wdata_start(void)
+static void wdata_start(struct drive* drv)
 {
     struct write *write;
     uint32_t start_pos;
@@ -409,21 +408,21 @@ static void wdata_start(void)
 
     /* Find rotational start position of the write, in SYSCLK ticks. */
     start_pos = max_t(int32_t, 0, time_diff(index.prev_time, time_now()));
-    start_pos %= drive.image->stk_per_rev;
+    start_pos %= drv->image->stk_per_rev;
     start_pos *= SYSCLK_MHZ / STK_MHZ;
     write = get_write(image, image->wr_prod);
     write->start = start_pos;
-    write->track = drive_calc_track(&drive);
+    write->track = drive_calc_track(drv);
 
     /* Allow IDX pulses while handling a write. */
-    drive.index_suppressed = FALSE;
+    drv->index_suppressed = FALSE;
 
     /* Exit head-settling state. Ungates INDEX signal. */
-    cmpxchg(&drive.step.state, STEP_settling, 0);
+    cmpxchg(&drv->step.state, STEP_settling, 0);
 }
 
 /* Called from IRQ context to stop the read stream. */
-static void rdata_stop(void)
+static void rdata_stop(struct drive* drv)
 {
     uint8_t prev_state = dma_rd->state;
 
@@ -446,13 +445,13 @@ static void rdata_stop(void)
 
     /* track-change = instant: Restart read stream where we left off. */
     if ((ff_cfg.track_change == TRKCHG_instant)
-        && !drive.index_suppressed
+        && !drv->index_suppressed
         && ff_cfg.index_suppression)
-        drive_set_restart_pos(&drive);
+        drive_set_restart_pos(drv);
 }
 
 /* Called from user context to start the read stream. */
-static void rdata_start(void)
+static void rdata_start(struct drive* drv)
 {
     IRQ_global_disable();
 
@@ -468,11 +467,11 @@ static void rdata_start(void)
     tim_rdata->cr1 = TIM_CR1_CEN;
 
     /* Enable output. */
-    if (drive.sel)
+    if (drv->sel)
         gpio_configure_pin(gpio_data, pin_rdata, AFO_rdata);
 
     /* Exit head-settling state. Ungates INDEX signal. */
-    cmpxchg(&drive.step.state, STEP_settling, 0);
+    cmpxchg(&drv->step.state, STEP_settling, 0);
 
 out:
     IRQ_global_enable();
@@ -553,8 +552,7 @@ static bool_t dma_wr_handle(struct drive *drv)
 
 bool_t floppy_handle(void)
 {
-    struct drive *drv = &drive;
-
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
     return ((dma_wr->state == DMA_inactive)
             ? dma_rd_handle : dma_wr_handle)(drv);
 }
@@ -565,7 +563,7 @@ static void IRQ_rdata_dma(void)
     uint32_t prev_ticks_since_index, ticks, i;
     uint16_t nr_to_wrap, nr_to_cons, nr, dmacons, done;
     time_t now;
-    struct drive *drv = &drive;
+    struct drive *drv = drive1.sel ? &drive1 : &drive0;
 
     /* Clear DMA peripheral interrupts. */
     dma1->ifcr = DMA_IFCR_CGIF(dma_rdata_ch);
